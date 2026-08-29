@@ -7,9 +7,9 @@ import requests
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from PIL import Image, ImageOps, ImageDraw, ImageFilter
-# pyrefly: ignore [missing-import]
-import rembg
+from PIL import Image
+from google import genai
+from google.genai import types
 
 import config
 
@@ -20,20 +20,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("image-service")
 
-# Initialize rembg session once at module load (startup)
-logger.info("Initializing rembg (u2netp) model session...")
-try:
-    rembg_session = rembg.new_session("u2netp")
-    logger.info("rembg session initialized successfully.")
-except Exception as e:
-    logger.error(f"Failed to initialize rembg session: {str(e)}")
-    # We don't crash here so that health check and startup can still proceed
-    rembg_session = None
-
 app = FastAPI(
     title="ArtiLink Image Microservice",
-    description="Microservice to isolate products and regenerate background using AI inpainting.",
-    version="1.0.0"
+    description="Microservice to process product photos and regenerate backgrounds using Gemini 2.5 Flash Image.",
+    version="2.0.0"
 )
 
 # Enable permissive CORS for hackathon cross-origin calls
@@ -51,33 +41,39 @@ def health_check():
     return {"status": "ok"}
 
 
-def create_vertical_gradient(size, color_start, color_end):
-    """
-    Creates a vertical gradient image transitioning from color_start (top)
-    to color_end (bottom) as a professional studio cyclorama backdrop.
-    """
-    width, height = size
-    # Create a 1D gradient line
-    gradient = Image.new("L", (1, height))
-    for y in range(height):
-        # Interpolate from 0 (start) to 255 (end)
-        val = int(y * 255 / (height - 1) if height > 1 else 0)
-        gradient.putpixel((0, y), val)
-    
-    # Resize to fill the full width of the image
-    gradient = gradient.resize((width, height))
-    
-    # Create start and end color images
-    start_img = Image.new("RGB", (width, height), color_start)
-    end_img = Image.new("RGB", (width, height), color_end)
-    
-    # Composite them using the gradient as the mask
-    return Image.composite(end_img, start_img, gradient)
+def upload_to_supabase(image_bytes: bytes) -> str:
+    """Uploads image bytes to Supabase Storage and returns the public CDN URL."""
+    now = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    unique_id = uuid.uuid4().hex[:8]
+    file_path = f"processed_{now}_{unique_id}.jpg"
+
+    supabase_upload_url = f"{config.SUPABASE_URL.rstrip('/')}/storage/v1/object/{config.SUPABASE_BUCKET}/{file_path}"
+    supabase_headers = {
+        "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
+        "apikey": config.SUPABASE_SERVICE_KEY,
+        "Content-Type": "image/jpeg"
+    }
+
+    logger.info(f"Uploading image to Supabase path: {file_path}")
+    response = requests.post(
+        supabase_upload_url,
+        headers=supabase_headers,
+        data=image_bytes,
+        timeout=15
+    )
+
+    if response.status_code not in (200, 201):
+        logger.error(f"Supabase upload returned status {response.status_code}: {response.text}")
+        raise Exception(f"Failed to upload image to Supabase: {response.text}")
+        
+    public_url = f"{config.SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{config.SUPABASE_BUCKET}/{file_path}"
+    logger.info(f"Successfully uploaded image to Supabase. CDN URL: {public_url}")
+    return public_url
 
 
-def run_image_pipeline(file_bytes: bytes, prompt: str) -> dict:
+def run_image_pipeline(file_contents: list[bytes], notes: str) -> dict:
     """
-    Synchronous pipeline function that processes the image.
+    Synchronous pipeline function that processes the images using Gemini 2.5 Flash Image.
     Executed in a background thread pool by FastAPI to prevent blocking the event loop.
     """
     # 1. Validate environment configuration
@@ -89,320 +85,183 @@ def run_image_pipeline(file_bytes: bytes, prompt: str) -> dict:
             detail=f"Server configuration error. Missing settings: {', '.join(missing_vars)}"
         )
     
-    if rembg_session is None:
-        logger.error("rembg session is not initialized.")
-        raise HTTPException(
-            status_code=500,
-            detail="Background removal engine is not initialized."
-        )
-
-    # 2. Isolate product cutout
-    logger.info("Step 2: Running rembg to isolate product...")
-    try:
-        input_image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        
-        # Stability/RAM optimization: Downscale high-resolution images to a maximum of 1024px
-        # to prevent Out of Memory (OOM) crashes on Railway's 512MB RAM free tier.
-        max_dimension = 1024
-        if max(input_image.size) > max_dimension:
-            logger.info(f"Resizing high-res input from {input_image.size} to max {max_dimension}px for stability...")
-            input_image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    # 2. Process and downscale input images for performance/RAM stability
+    logger.info(f"Step 2: Processing {len(file_contents)} input images...")
+    pil_images = []
+    for idx, content in enumerate(file_contents):
+        try:
+            img = Image.open(io.BytesIO(content)).convert("RGB")
             
-        # remove background, producing an RGBA image
-        rgba_image = rembg.remove(input_image, session=rembg_session)
-    except Exception as e:
-        logger.exception("rembg execution failed")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to isolate product from background: {str(e)}"
-        )
-
-    # 3. Build inpainting mask (invert alpha) and feather cutout edges
-    logger.info("Step 3: Creating inverted inpainting mask and feathering cutout edges...")
-    try:
-        # Extract sharp original alpha channel
-        alpha = rgba_image.split()[3]
-        
-        # Apply a slight Gaussian blur (radius 2px) to the alpha channel edges for soft blending
-        feathered_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=2))
-        
-        # Merge the feathered alpha channel back into rgba_image
-        r, g, b, _ = rgba_image.split()
-        rgba_image = Image.merge("RGBA", (r, g, b, feathered_alpha))
-        
-        # Build inverted mask from original sharp alpha channel (white = inpaint, black = keep product)
-        mask_image = ImageOps.invert(alpha)
-    except Exception as e:
-        logger.exception("Failed to build mask from alpha channel")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate processing mask: {str(e)}"
-        )
-
-    # 4. Generate Image Caption using Salesforce/blip-image-captioning-large
-    caption = None
-    logger.info("Step 4a: Calling Hugging Face for image captioning...")
-    try:
-        caption_headers = {
-            "Authorization": f"Bearer {config.HF_API_TOKEN}"
-        }
-        caption_response = requests.post(
-            "https://router.huggingface.co/hf-inference/models/Salesforce/blip-image-captioning-large",
-            headers=caption_headers,
-            data=file_bytes,
-            timeout=10
-        )
-        logger.info(f"Image captioning API response status code: {caption_response.status_code}")
-        
-        if caption_response.status_code == 200:
-            result = caption_response.json()
-            if isinstance(result, list) and len(result) > 0 and "generated_text" in result[0]:
-                caption = result[0]["generated_text"].strip()
-                logger.info(f"Successfully generated image caption: '{caption}'")
-            else:
-                logger.warning(f"Unexpected image captioning response format: {result}")
-        else:
-            try:
-                cap_error = caption_response.json()
-            except Exception:
-                cap_error = caption_response.text
-            logger.warning(
-                f"Image captioning API returned status {caption_response.status_code}: {cap_error}. "
-                "Gracefully falling back to generic e-commerce prompt."
-            )
-    except Exception as e:
-        logger.warning(
-            f"Image captioning API call failed or timed out: {str(e)}. "
-            "Gracefully falling back to generic e-commerce prompt."
-        )
-
-    # 5. Request background regeneration from Hugging Face Inference API
-    logger.info("Step 4b: Requesting background regeneration from Hugging Face Inference API...")
-    
-    # Construct prompts
-    if prompt:
-        prompt_str = prompt
-        logger.info(f"Using user-provided custom prompt: '{prompt_str}'")
-    else:
-        if caption:
-            prompt_str = f"professional e-commerce studio background suited for {caption}, soft complementary color palette, elegant minimal styled surface, soft diffused studio lighting, subtle realistic shadow, photorealistic, 8k, sharp focus on product, no text, no watermark, no logo"
-            logger.info(f"Using dynamically generated prompt: '{prompt_str}'")
-        else:
-            prompt_str = "soft neutral gradient studio background, professional e-commerce lighting, photorealistic, subtle shadow"
-            logger.info(f"Using generic fallback prompt: '{prompt_str}'")
-
-    negative_prompt_str = (
-        "flat plain white, harsh lighting, blown out highlights, cartoon, illustration, "
-        "blurry, low quality, distorted, extra objects, text, watermark, logo"
-    )
-    logger.info(f"Final Inpainting Prompt: '{prompt_str}'")
-    logger.info(f"Shared Negative Prompt: '{negative_prompt_str}'")
-
-    # Prepare images as Base64 encoded PNGs for Hugging Face REST API
-    original_buffered = io.BytesIO()
-    input_image.save(original_buffered, format="PNG")
-    original_b64 = base64.b64encode(original_buffered.getvalue()).decode("utf-8")
-
-    mask_buffered = io.BytesIO()
-    mask_image.save(mask_buffered, format="PNG")
-    mask_b64 = base64.b64encode(mask_buffered.getvalue()).decode("utf-8")
-
-    hf_headers = {
-        "Authorization": f"Bearer {config.HF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    hf_payload = {
-        "inputs": prompt_str,
-        "image": original_b64,
-        "mask_image": mask_b64,
-        "parameters": {
-            "negative_prompt": negative_prompt_str
-        }
-    }
-
-    hf_success = False
-    inpainted_bg = None
-
-    try:
-        response = requests.post(
-            "https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-2-inpainting",
-            headers=hf_headers,
-            json=hf_payload,
-            timeout=15
-        )
-        
-        logger.info(f"Hugging Face inpainting API response status code: {response.status_code}")
-        
-        if response.status_code == 200:
-            inpainted_bg = Image.open(io.BytesIO(response.content)).convert("RGB")
-            hf_success = True
-            logger.info("Hugging Face inpainting call SUCCEEDED. AI background generated successfully.")
-        else:
-            try:
-                error_body = response.json()
-            except Exception:
-                error_body = response.text
+            # Stability/RAM optimization: Downscale high-resolution images to a maximum of 1024px
+            # to prevent Out of Memory (OOM) crashes on Railway's 512MB RAM free tier.
+            max_dimension = 1024
+            if max(img.size) > max_dimension:
+                logger.info(f"Resizing input image {idx+1} from {img.size} to max {max_dimension}px for stability...")
+                img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
                 
-            logger.error(
-                f"Hugging Face inpainting API FAILED (Status: {response.status_code}). Error body: {error_body}. "
-                "Triggering fallback light-grey-to-white gradient background."
-            )
-    except Exception as e:
-        logger.error(
-            f"Hugging Face inpainting API request failed or timed out: {str(e)}. "
-            "Triggering fallback light-grey-to-white gradient background."
-        )
-
-    # 6. Composite original cutout back on top with drop shadow
-    logger.info("Step 5: Compositing isolated product cutout onto background...")
-    try:
-        # Determine base background
-        if hf_success and inpainted_bg is not None:
-            # Resize background if dimensions do not match the input
-            if inpainted_bg.size != input_image.size:
-                logger.info(f"Resizing generated background from {inpainted_bg.size} to {input_image.size}")
-                inpainted_bg = inpainted_bg.resize(input_image.size, Image.Resampling.LANCZOS)
-            base_bg = inpainted_bg.copy()
-        else:
-            # Fallback to nice soft light-grey-to-white gradient background
-            logger.info("Applying fallback: creating soft light-grey-to-white gradient background...")
-            base_bg = create_vertical_gradient(
-                input_image.size,
-                (255, 255, 255),  # Top: White
-                (230, 230, 230)   # Bottom: Soft light-grey
-            )
-
-        # Generate soft elliptical drop shadow layer beneath the product
-        # Get bounding box of the cutout using the original alpha channel
-        bbox = alpha.getbbox()
-        if bbox:
-            left, top, right, bottom = bbox
-            width_box = right - left
-            center_x = (left + right) // 2
-            
-            # Shadow dimensions relative to the product width
-            shadow_w = int(width_box * 0.90)  # slightly narrower than product
-            shadow_h = int(width_box * 0.15)  # elliptical height (vertical thickness)
-            
-            # Bounding box coordinates for the shadow ellipse at the bottom of the product
-            shadow_box = (
-                center_x - shadow_w // 2,
-                bottom - shadow_h // 2,
-                center_x + shadow_w // 2,
-                bottom + shadow_h // 2
-            )
-            
-            logger.info(f"Generating soft elliptical drop shadow at bounding box: {shadow_box}")
-            
-            # Create a transparent overlay for the shadow
-            shadow_layer = Image.new("RGBA", base_bg.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(shadow_layer)
-            
-            # Draw a semi-transparent dark grey ellipse
-            shadow_color = (40, 40, 40, 110)
-            draw.ellipse(shadow_box, fill=shadow_color)
-            
-            # Blur the shadow to make it soft and realistic
-            blur_radius = max(3, shadow_h // 3)
-            shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-            
-            # Paste the shadow layer onto the background layer
-            base_bg.paste(shadow_layer, (0, 0), mask=shadow_layer)
-            logger.info("Soft drop shadow successfully applied beneath product position.")
-        else:
-            logger.warning("Product alpha channel has no bounding box. Skipping shadow.")
-
-        # Composite the product cutout (rgba_image with feathered alpha) on top
-        final_image = base_bg.convert("RGB")
-        final_image.paste(rgba_image, (0, 0), mask=rgba_image)
-        logger.info("Successfully composited product cutout onto final image.")
-        
-    except Exception as e:
-        logger.exception("Failed to composite product cutout onto background")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Image composition failed: {str(e)}"
-        )
-
-    # 7. Upload final JPEG to Supabase Storage via REST
-    logger.info("Step 6: Converting composite to JPEG and uploading to Supabase Storage...")
-    try:
-        jpeg_buffered = io.BytesIO()
-        final_image.save(jpeg_buffered, format="JPEG", quality=90)
-        jpeg_bytes = jpeg_buffered.getvalue()
-
-        # Generate unique path using timestamp and random string
-        now = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        unique_id = uuid.uuid4().hex[:8]
-        file_path = f"processed_{now}_{unique_id}.jpg"
-
-        supabase_upload_url = f"{config.SUPABASE_URL.rstrip('/')}/storage/v1/object/{config.SUPABASE_BUCKET}/{file_path}"
-        supabase_headers = {
-            "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
-            "apikey": config.SUPABASE_SERVICE_KEY,
-            "Content-Type": "image/jpeg"
-        }
-
-        upload_response = requests.post(
-            supabase_upload_url,
-            headers=supabase_headers,
-            data=jpeg_bytes,
-            timeout=15
-        )
-
-        if upload_response.status_code not in (200, 201):
-            logger.error(f"Supabase upload returned status {upload_response.status_code}: {upload_response.text}")
+            pil_images.append(img)
+        except Exception as e:
+            logger.error(f"Failed to open/resize image {idx+1}: {str(e)}")
             raise HTTPException(
-                status_code=502,
-                detail=f"Failed to upload image to Supabase: {upload_response.text}"
+                status_code=400,
+                detail=f"Failed to read file at index {idx+1}. Make sure it is a valid JPG/PNG image."
             )
-        logger.info("Uploaded processed image to Supabase Storage.")
-    except HTTPException as he:
-        raise he
+
+    # 3. Build the prompt dynamically
+    base_prompt = (
+        "These images show the same handcrafted product from different angles. "
+        "For each image, keep the product completely unchanged in shape, color, texture and detail. "
+        "Replace the background with an elegant, professional e-commerce studio background appropriate for "
+        "this type of product — soft complementary color palette, minimal styled surface, soft diffused studio "
+        "lighting, realistic soft shadow beneath the product. Keep the same background style and lighting "
+        "consistent across all images so they look like one cohesive product photoshoot. "
+        "Do not alter the product's pose, shape, or any physical detail. Do not add any text, watermark, or logo."
+    )
+    if notes:
+        prompt_str = f"This product is: {notes}. {base_prompt}"
+    else:
+        prompt_str = base_prompt
+
+    # 4. Call Gemini 2.5 Flash Image API
+    logger.info("Step 3: Initializing Gemini Client and calling API...")
+    # Initialize genai client with 35 seconds request timeout
+    client = genai.Client(
+        api_key=config.GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=35_000)
+    )
+
+    contents_payload = pil_images + [prompt_str]
+    logger.info(f"Sending prompt: '{prompt_str}'")
+
+    generated_images = []
+    hf_success = False
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=contents_payload,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"]
+            )
+        )
+        
+        # Parse output images from parts
+        if response.candidates and len(response.candidates) > 0:
+            content = response.candidates[0].content
+            if content and content.parts:
+                for part in content.parts:
+                    if part.inline_data and part.inline_data.data:
+                        generated_images.append(part.inline_data.data)
+                        
+        if len(generated_images) > 0:
+            hf_success = True
+            logger.info(f"Gemini API returned {len(generated_images)} generated images successfully.")
+            if len(generated_images) < len(file_contents):
+                logger.warning(
+                    f"Gemini API returned fewer images ({len(generated_images)}) than were uploaded ({len(file_contents)})."
+                )
+        else:
+            logger.error("Gemini API call succeeded but returned 0 images in the response parts.")
+            
     except Exception as e:
-        logger.exception("Failed to upload output image to Supabase")
+        logger.error(f"Gemini API call failed or timed out: {str(e)}")
+
+    # 5. Upload to Supabase (with fallback handling)
+    cleaned_urls = []
+    is_fallback = False
+
+    if hf_success and len(generated_images) > 0:
+        logger.info("Step 4: Uploading generated images to Supabase Storage...")
+        for idx, img_bytes in enumerate(generated_images):
+            try:
+                url = upload_to_supabase(img_bytes)
+                cleaned_urls.append(url)
+                logger.info(f"Uploaded generated image {idx+1}/{len(generated_images)} successfully.")
+            except Exception as e:
+                logger.error(f"Failed to upload generated image {idx+1}: {str(e)}")
+    else:
+        # Fallback path: Upload original images unmodified
+        logger.warning("Triggering local fallback: uploading original images unmodified to Supabase...")
+        is_fallback = True
+        for idx, img_bytes in enumerate(file_contents):
+            try:
+                url = upload_to_supabase(img_bytes)
+                cleaned_urls.append(url)
+                logger.info(f"Uploaded fallback original image {idx+1}/{len(file_contents)} successfully.")
+            except Exception as e:
+                logger.error(f"Failed to upload fallback image {idx+1}: {str(e)}")
+
+    # Ensure we return at least an empty list if all uploads failed, but raise 502 if nothing could upload
+    if len(cleaned_urls) == 0:
+        logger.error("Failed to upload any images (generated or fallback) to Supabase Storage.")
         raise HTTPException(
             status_code=502,
-            detail=f"Supabase Storage connection failed: {str(e)}"
+            detail="Failed to upload output images to cloud storage."
         )
 
-    # 8. Return public URL
-    public_url = f"{config.SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{config.SUPABASE_BUCKET}/{file_path}"
-    logger.info(f"Pipeline successful. Returning public URL: {public_url}")
-    return {"cleaned_image_url": public_url}
+    return {
+        "cleaned_image_urls": cleaned_urls,
+        "fallback": is_fallback
+    }
 
 
-@app.post("/process-image")
-async def process_image(
-    file: UploadFile = File(...),
-    prompt: str = Form(None)
+@app.post("/process-images")
+async def process_images(
+    files: list[UploadFile] = File(...),
+    notes: str = Form(None)
 ):
     """
-    Main endpoint accepting raw product photo and prompt.
-    Returns JSON containing the cleaned_image_url.
+    Main endpoint accepting 1 to 4 raw product photos and optional notes.
+    Returns JSON containing array of cleaned_image_urls.
     """
-    logger.info("Received request on /process-image")
+    logger.info("Received request on /process-images")
     
-    # Validate request payload
-    if not file or not file.filename:
-        logger.error("Request missing upload file")
-        raise HTTPException(status_code=400, detail="Empty upload file.")
+    # 1. Validation
+    if not files or len(files) == 0:
+        logger.error("Request missing upload files")
+        raise HTTPException(status_code=400, detail="At least one image file must be uploaded.")
 
-    if not file.content_type.startswith("image/"):
-        logger.error(f"Invalid file content type: {file.content_type}")
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.")
+    if len(files) > 4:
+        logger.error(f"Uploaded {len(files)} files, which exceeds the limit of 4")
+        raise HTTPException(status_code=400, detail="You can upload a maximum of 4 files.")
 
-    file_bytes = await file.read()
-    if len(file_bytes) == 0:
-        logger.error("Uploaded file has zero bytes")
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    file_contents = []
+    for file in files:
+        if not file.filename:
+            continue
+            
+        # Check supported file types (JPG, JPEG, PNG)
+        content_type = file.content_type
+        if not content_type or not content_type.startswith("image/"):
+            logger.error(f"File {file.filename} is not an image.")
+            raise HTTPException(status_code=400, detail=f"File {file.filename} is not an image.")
+            
+        file_ext = content_type.split("/")[-1].lower()
+        if file_ext not in ("jpeg", "jpg", "png"):
+            logger.error(f"Unsupported file format: {file_ext} for file {file.filename}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format for {file.filename}. Only JPG, JPEG, and PNG are allowed."
+            )
 
+        content = await file.read()
+        if len(content) == 0:
+            logger.error(f"Uploaded file {file.filename} is empty")
+            raise HTTPException(status_code=400, detail=f"Uploaded file {file.filename} is empty.")
+            
+        file_contents.append(content)
+
+    if len(file_contents) == 0:
+        logger.error("No valid upload files found in request")
+        raise HTTPException(status_code=400, detail="At least one valid image file must be uploaded.")
+
+    logger.info(f"Processing {len(file_contents)} files successfully validated. Starting background threadpool...")
+    
     # Execute the heavy blocking pipeline in FastAPI's external thread pool
     try:
-        result = await run_in_threadpool(run_image_pipeline, file_bytes, prompt)
+        result = await run_in_threadpool(run_image_pipeline, file_contents, notes)
         return result
     except HTTPException as he:
-        # Re-raise standard HTTP exceptions
         raise he
     except Exception as e:
         logger.exception("Unhandled error in processing pipeline")
