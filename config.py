@@ -8,7 +8,7 @@ logger = logging.getLogger("image-service.config")
 # Load variables from .env if present
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET")
@@ -17,8 +17,8 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET")
 # This allows the FastAPI app to start up and run health checks
 def validate_config():
     missing = []
-    if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
+    if not HF_API_TOKEN:
+        missing.append("HF_API_TOKEN")
     if not SUPABASE_URL:
         missing.append("SUPABASE_URL")
     if not SUPABASE_SERVICE_KEY:
@@ -31,7 +31,7 @@ missing_vars = validate_config()
 if missing_vars:
     logger.warning(
         f"Missing configuration variables: {', '.join(missing_vars)}. "
-        "The /process-images endpoint will fail with HTTP 500 until these are provided."
+        "The /process-image endpoint will fail with HTTP 500 until these are provided."
     )
 else:
     logger.info("All configuration environment variables loaded successfully.")
