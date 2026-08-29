@@ -100,6 +100,14 @@ def run_image_pipeline(file_bytes: bytes, prompt: str) -> dict:
     logger.info("Step 2: Running rembg to isolate product...")
     try:
         input_image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        
+        # Stability/RAM optimization: Downscale high-resolution images to a maximum of 1024px
+        # to prevent Out of Memory (OOM) crashes on Railway's 512MB RAM free tier.
+        max_dimension = 1024
+        if max(input_image.size) > max_dimension:
+            logger.info(f"Resizing high-res input from {input_image.size} to max {max_dimension}px for stability...")
+            input_image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+            
         # remove background, producing an RGBA image
         rgba_image = rembg.remove(input_image, session=rembg_session)
     except Exception as e:
