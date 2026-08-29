@@ -21,9 +21,9 @@ logging.basicConfig(
 logger = logging.getLogger("image-service")
 
 # Initialize rembg session once at module load (startup)
-logger.info("Initializing rembg (u2net) model session...")
+logger.info("Initializing rembg (u2netp) model session...")
 try:
-    rembg_session = rembg.new_session("u2net")
+    rembg_session = rembg.new_session("u2netp")
     logger.info("rembg session initialized successfully.")
 except Exception as e:
     logger.error(f"Failed to initialize rembg session: {str(e)}")
